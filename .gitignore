@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+/generated/
+
+# Local binaries
+/kppc
+*.exe
+*.out
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# Temp logs
+*.log

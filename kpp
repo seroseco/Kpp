@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_DIR="$ROOT_DIR/generated/bin"
+CPP_DIR="$ROOT_DIR/generated/cpp"
+KPP_BIN="$BIN_DIR/kppc"
+
+SRC_FILES=(
+  "$ROOT_DIR/src/main.cpp"
+  "$ROOT_DIR/src/transpiler.cpp"
+  "$ROOT_DIR/src/dictionary.cpp"
+  "$ROOT_DIR/include/transpiler.hpp"
+  "$ROOT_DIR/include/dictionary.hpp"
+)
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./kpp init [file.kpp]
+  ./kpp <input.kpp> [-o output.cpp] [--stdout] [--run] [--safe]
+
+Examples:
+  ./kpp init
+  ./kpp init practice.kpp
+  ./kpp examples/kpp/hello.kpp
+  ./kpp examples/kpp/hello.kpp --run
+  ./kpp examples/kpp/hello.kpp --safe
+  ./kpp examples/kpp/hello.kpp --stdout
+USAGE
+}
+
+init_project_file() {
+  local target="${1:-main.kpp}"
+  if [[ "$target" != *.kpp ]]; then
+    target="${target}.kpp"
+  fi
+
+  if [[ -e "$target" ]]; then
+    echo "[K++] 오류: 이미 파일이 존재합니다: $target" >&2
+    exit 1
+  fi
+
+  if [[ "$target" == */* ]]; then
+    mkdir -p "$(dirname "$target")"
+  fi
+
+  cat > "$target" <<'EOF'
+#포함 <iostream>
+
+사용 범위 표준;
+
+정수 진입() {
+  출력 << "K++ 시작!" << 끝줄;
+  반환 0;
+}
+EOF
+
+  echo "[K++] 생성 완료: $target"
+  echo "[K++] 실행 예시: ./kpp --run $target"
+}
+
+add_header_if_needed() {
+  local cpp_path="$1"
+  local scan_path="$2"
+  local header="$3"
+  local pattern="$4"
+
+  if grep -qE "^[[:space:]]*#include[[:space:]]*<${header}>[[:space:]]*$" "$cpp_path"; then
+    return
+  fi
+
+  if grep -qE "$pattern" "$scan_path"; then
+    REQUIRED_HEADERS+=("$header")
+  fi
+}
+
+strip_code_for_scan() {
+  local input_path="$1"
+  local output_path="$2"
+
+  perl - "$input_path" > "$output_path" <<'PL'
+use strict;
+use warnings;
+
+my $state = 'normal';  # normal, string, char, block_comment
+
+while (my $line = <>) {
+  chomp $line;
+  my @c = split //, $line;
+  my $out = '';
+  my $i = 0;
+
+  while ($i <= $#c) {
+    my $ch = $c[$i];
+    my $nx = ($i < $#c) ? $c[$i + 1] : '';
+
+    if ($state eq 'normal') {
+      if ($ch eq '/' && $nx eq '/') {
+        $out .= ' ' x ($#c - $i + 1);
+        last;
+      }
+      if ($ch eq '/' && $nx eq '*') {
+        $out .= '  ';
+        $i += 2;
+        $state = 'block_comment';
+        next;
+      }
+      if ($ch eq '"') {
+        $out .= ' ';
+        $i++;
+        $state = 'string';
+        next;
+      }
+      if ($ch eq "'") {
+        $out .= ' ';
+        $i++;
+        $state = 'char';
+        next;
+      }
+      $out .= $ch;
+      $i++;
+      next;
+    }
+
+    if ($state eq 'string') {
+      if ($ch eq '\\' && $i < $#c) {
+        $out .= '  ';
+        $i += 2;
+        next;
+      }
+      $out .= ' ';
+      $state = 'normal' if $ch eq '"';
+      $i++;
+      next;
+    }
+
+    if ($state eq 'char') {
+      if ($ch eq '\\' && $i < $#c) {
+        $out .= '  ';
+        $i += 2;
+        next;
+      }
+      $out .= ' ';
+      $state = 'normal' if $ch eq "'";
+      $i++;
+      next;
+    }
+
+    if ($state eq 'block_comment') {
+      if ($ch eq '*' && $nx eq '/') {
+        $out .= '  ';
+        $i += 2;
+        $state = 'normal';
+        next;
+      }
+      $out .= ' ';
+      $i++;
+      next;
+    }
+  }
+
+  print "$out\n";
+}
+PL
+}
+
+ensure_required_headers() {
+  local cpp_path="$1"
+  local scan_tmp
+  scan_tmp="$(mktemp)"
+  strip_code_for_scan "$cpp_path" "$scan_tmp"
+
+  REQUIRED_HEADERS=()
+
+  add_header_if_needed "$cpp_path" "$scan_tmp" "iostream" "\\b(cout|cin|endl)\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "string" "\\bstring\\b"
+
+  add_header_if_needed "$cpp_path" "$scan_tmp" "vector" "\\bvector\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "array" "\\barray\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "list" "\\blist\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "deque" "\\bdeque\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "queue" "\\b(queue|priority_queue)\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "stack" "\\bstack\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "map" "\\bmap\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "set" "\\bset\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "unordered_map" "\\bunordered_map\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "unordered_set" "\\bunordered_set\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "utility" "\\bpair\\b"
+
+  add_header_if_needed "$cpp_path" "$scan_tmp" "algorithm" "\\b(sort|unique|find|min_element|max_element|reverse|swap|count)\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "numeric" "\\baccumulate\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "exception" "\\b(exception|runtime_error|logic_error|out_of_range)\\b"
+  add_header_if_needed "$cpp_path" "$scan_tmp" "stdexcept" "\\b(runtime_error|logic_error|out_of_range|invalid_argument)\\b"
+
+  if [[ ${#REQUIRED_HEADERS[@]} -eq 0 ]]; then
+    rm -f "$scan_tmp"
+    return
+  fi
+
+  local uniq_headers=()
+  local seen=""
+  for h in "${REQUIRED_HEADERS[@]}"; do
+    if [[ ",$seen," != *",$h,"* ]]; then
+      uniq_headers+=("$h")
+      seen="${seen},${h}"
+    fi
+  done
+
+  local tmp
+  tmp="$(mktemp)"
+  {
+    for h in "${uniq_headers[@]}"; do
+      echo "#include <$h>"
+    done
+    cat "$cpp_path"
+  } > "$tmp"
+  mv "$tmp" "$cpp_path"
+  rm -f "$scan_tmp"
+
+  echo "[K++] 누락 헤더 자동 추가: ${uniq_headers[*]}"
+}
+
+show_korean_compile_error() {
+  local error_file="$1"
+  local first_line
+  first_line="$(grep -m1 "error:" "$error_file" || true)"
+
+  if [[ -z "$first_line" ]]; then
+    cat "$error_file" >&2
+    return
+  fi
+
+  if [[ "$first_line" =~ ^([^:]+):([0-9]+):([0-9]+):[[:space:]]+error:[[:space:]](.*)$ ]]; then
+    local file_path="${BASH_REMATCH[1]}"
+    local line_no="${BASH_REMATCH[2]}"
+    local col_no="${BASH_REMATCH[3]}"
+    local message="${BASH_REMATCH[4]}"
+    echo "[K++] 컴파일 실패" >&2
+    echo "  위치: ${file_path}:${line_no}:${col_no}" >&2
+    echo "  원인: ${message}" >&2
+    echo "  팁: 문법, 세미콜론, 괄호, 필요한 헤더를 확인해보세요." >&2
+  else
+    echo "[K++] 컴파일 실패: $(echo "$first_line" | sed 's/^.*error:[[:space:]]*//')" >&2
+    echo "  상세 로그:" >&2
+    cat "$error_file" >&2
+  fi
+}
+
+find_keyword_collisions() {
+  local source_file="$1"
+  local scan_tmp
+  scan_tmp="$(mktemp)"
+  strip_code_for_scan "$source_file" "$scan_tmp"
+
+  local keyword_regex
+  keyword_regex='(포함|사용|범위|표준|정수|짧은|긴|매우긴|뜨다|실수|숯|불|참|거짓|빈|자동|부호없는|부호있는|상수|정적|새로|삭제|널|출력|입력|끝줄|반환|진입|반복|동안|실행|만약|아니면|스위치|경우|기본|멈춰|계속|이동|시도|잡기|던지기|문자열|클래스|구조체|공개|비공개|보호|가상|템플릿|자료형|벡터|배열|목록|덱|큐|스택|우선큐|맵|집합|순서없는맵|순서없는집합|쌍|정렬|역정렬|교환|중복제거|찾기|개수|누적|최소값|최대값|시작|끝|크기|비었나|비우기|뒤에추가|앞에추가|뒤에서제거|앞에서제거)'
+  local type_regex
+  type_regex='(정수|짧은|긴|매우긴|뜨다|실수|숯|불|문자열|자동|벡터|배열|목록|덱|큐|스택|우선큐|맵|집합|순서없는맵|순서없는집합|쌍)'
+
+  local decl_hits class_hits filtered_hits
+  decl_hits="$(grep -nE "${type_regex}[[:space:]]+${keyword_regex}\\b" "$scan_tmp" || true)"
+  class_hits="$(grep -nE "(클래스|구조체)[[:space:]]+${keyword_regex}\\b" "$scan_tmp" || true)"
+
+  filtered_hits="$(printf '%s\n%s\n' "$decl_hits" "$class_hits" | \
+    grep -vE '^[[:space:]]*$' | \
+    grep -vE "${type_regex}[[:space:]]+진입[[:space:]]*\\(" || true)"
+
+  if [[ -n "$filtered_hits" ]]; then
+    echo "[K++] 키워드 충돌 감지(--safe):" >&2
+    echo "$filtered_hits" | while IFS= read -r hit; do
+      local line_no content
+      line_no="${hit%%:*}"
+      content="$(sed -n "${line_no}p" "$source_file")"
+      echo "  - ${source_file}:${line_no} -> ${content}" >&2
+    done
+    echo "  팁: 변수/함수/클래스 이름을 키워드와 겹치지 않게 바꿔주세요." >&2
+    rm -f "$scan_tmp"
+    return 1
+  fi
+
+  rm -f "$scan_tmp"
+  return 0
+}
+
+needs_rebuild() {
+  if [[ ! -x "$KPP_BIN" ]]; then
+    return 0
+  fi
+
+  for f in "${SRC_FILES[@]}"; do
+    if [[ "$f" -nt "$KPP_BIN" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+build_kppc() {
+  mkdir -p "$BIN_DIR" "$CPP_DIR"
+  g++ -std=c++17 -I"$ROOT_DIR/include" \
+    "$ROOT_DIR/src/main.cpp" \
+    "$ROOT_DIR/src/transpiler.cpp" \
+    "$ROOT_DIR/src/dictionary.cpp" \
+    -o "$KPP_BIN"
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+run_after=false
+input_file=""
+output_cpp=""
+to_stdout=false
+safe_mode=false
+
+kppc_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    init)
+      if [[ $# -eq 1 ]]; then
+        init_project_file "main.kpp"
+        exit 0
+      fi
+      case "$2" in
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        -*)
+          echo "[K++] 오류: init 에 알 수 없는 옵션입니다: $2" >&2
+          exit 1
+          ;;
+        *)
+          init_project_file "$2"
+          exit 0
+          ;;
+      esac
+      exit 0
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --run)
+      run_after=true
+      shift
+      ;;
+    --safe|--collision-check)
+      safe_mode=true
+      shift
+      ;;
+    --stdout)
+      to_stdout=true
+      kppc_args+=("$1")
+      shift
+      ;;
+    -o)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: Missing value for -o" >&2
+        exit 1
+      fi
+      output_cpp="$2"
+      kppc_args+=("$1" "$2")
+      shift 2
+      ;;
+    -*)
+      kppc_args+=("$1")
+      shift
+      ;;
+    *)
+      if [[ -z "$input_file" ]]; then
+        input_file="$1"
+      fi
+      kppc_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$input_file" ]]; then
+  echo "[K++] 오류: input.kpp 파일이 필요합니다." >&2
+  usage
+  exit 1
+fi
+
+if [[ "$run_after" == true && "$to_stdout" == true ]]; then
+  echo "[K++] 오류: --run 과 --stdout 은 함께 사용할 수 없습니다." >&2
+  exit 1
+fi
+
+if [[ "$safe_mode" == true ]]; then
+  if ! find_keyword_collisions "$input_file"; then
+    exit 1
+  fi
+fi
+
+if needs_rebuild; then
+  echo "[K++] kppc 자동 빌드 중..."
+  build_kppc
+fi
+
+"$KPP_BIN" "${kppc_args[@]}"
+
+if [[ "$run_after" == true ]]; then
+  if [[ -n "$output_cpp" ]]; then
+    cpp_path="$output_cpp"
+  else
+    base_name="$(basename "$input_file")"
+    stem="${base_name%.*}"
+    cpp_path="$CPP_DIR/$stem.cpp"
+  fi
+
+  ensure_required_headers "$cpp_path"
+
+  stem="$(basename "$cpp_path")"
+  stem="${stem%.*}"
+  exe_path="$BIN_DIR/$stem"
+
+  mkdir -p "$BIN_DIR"
+  compile_log="$(mktemp)"
+  if ! g++ -std=c++17 "$cpp_path" -o "$exe_path" 2>"$compile_log"; then
+    show_korean_compile_error "$compile_log"
+    rm -f "$compile_log"
+    exit 1
+  fi
+  rm -f "$compile_log"
+  echo "[K++] 실행 파일: $exe_path"
+  "$exe_path"
+fi

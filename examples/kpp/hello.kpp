@@ -1,0 +1,7 @@
+#include <iostream>
+using namespace std;
+
+정수 진입() {
+  출력 << "안녕 세상!" << '\n';
+  반환 0;
+}
